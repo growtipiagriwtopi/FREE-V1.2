@@ -1,0 +1,922 @@
+--!strict
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local CONFIG = {
+	AuthorizedUserIds = {
+		[1] = true,
+	},
+	AllowStudioCreatorByDefault = true,
+	MinStat = 0,
+	MaxStat = 100,
+	DefaultSpeed = 16,
+	DefaultJump = 50,
+	MaxLockDistance = 300,
+	EspColor = Color3.fromRGB(255, 255, 255),
+	EspThickness = 2,
+
+	PanelBg = Color3.fromRGB(23, 14, 41),
+	HeaderBg = Color3.fromRGB(39, 22, 70),
+	CardBg = Color3.fromRGB(33, 19, 59),
+	TrackBg = Color3.fromRGB(56, 33, 99),
+	AccentPurple = Color3.fromRGB(124, 58, 237),
+	BorderPurple = Color3.fromRGB(150, 102, 255),
+	OnGreen = Color3.fromRGB(34, 197, 94),
+	OffRed = Color3.fromRGB(239, 68, 68),
+	TextLight = Color3.fromRGB(248, 250, 252),
+	TextSoft = Color3.fromRGB(205, 190, 255),
+}
+
+type PlayerState = {
+	speedEnabled: boolean,
+	speedValue: number,
+	jumpEnabled: boolean,
+	jumpValue: number,
+}
+
+local function sanitizeStat(value: any, fallback: number): number
+	if typeof(value) ~= "number" or value ~= value then
+		return fallback
+	end
+	return math.clamp(math.floor(value + 0.5), CONFIG.MinStat, CONFIG.MaxStat)
+end
+
+local remotesFolder = ReplicatedStorage:FindFirstChild("FreemiumRemotes") :: Folder?
+if not remotesFolder then
+	remotesFolder = Instance.new("Folder")
+	remotesFolder.Name = "FreemiumRemotes"
+	remotesFolder.Parent = ReplicatedStorage
+end
+
+local checkAccessFunc = remotesFolder:FindFirstChild("CheckDeveloperAccess") :: RemoteFunction?
+if not checkAccessFunc then
+	checkAccessFunc = Instance.new("RemoteFunction")
+	checkAccessFunc.Name = "CheckDeveloperAccess"
+	checkAccessFunc.Parent = remotesFolder
+end
+
+local updateMovementEvent = remotesFolder:FindFirstChild("UpdateMovementRequest") :: RemoteEvent?
+if not updateMovementEvent then
+	updateMovementEvent = Instance.new("RemoteEvent")
+	updateMovementEvent.Name = "UpdateMovementRequest"
+	updateMovementEvent.Parent = remotesFolder
+end
+
+local movementAppliedEvent = remotesFolder:FindFirstChild("MovementStateApplied") :: RemoteEvent?
+if not movementAppliedEvent then
+	movementAppliedEvent = Instance.new("RemoteEvent")
+	movementAppliedEvent.Name = "MovementStateApplied"
+	movementAppliedEvent.Parent = remotesFolder
+end
+
+if RunService:IsServer() then
+	local states: { [Player]: PlayerState } = {}
+
+	local function isAuthorized(player: Player): boolean
+		if CONFIG.AuthorizedUserIds[player.UserId] == true then
+			return true
+		end
+		if CONFIG.AllowStudioCreatorByDefault and game.CreatorType == Enum.CreatorType.User and player.UserId == game.CreatorId then
+			return true
+		end
+		return false
+	end
+
+	local function applyStats(player: Player, character: Model)
+		local state = states[player]
+		if not state then
+			return
+		end
+
+		local humanoid = character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid", 5) :: Humanoid?
+		if not humanoid then
+			return
+		end
+
+		local walkSpeed = if state.speedEnabled then state.speedValue else CONFIG.DefaultSpeed
+		local jumpPower = if state.jumpEnabled then state.jumpValue else CONFIG.DefaultJump
+
+		humanoid.WalkSpeed = math.clamp(walkSpeed, CONFIG.MinStat, CONFIG.MaxStat)
+		humanoid.UseJumpPower = true
+		humanoid.JumpPower = math.clamp(jumpPower, CONFIG.MinStat, CONFIG.MaxStat)
+
+		movementAppliedEvent:FireClient(player, {
+			speedEnabled = state.speedEnabled,
+			speedValue = state.speedValue,
+			jumpEnabled = state.jumpEnabled,
+			jumpValue = state.jumpValue,
+		})
+	end
+
+	checkAccessFunc.OnServerInvoke = function(player: Player): boolean
+		return isAuthorized(player)
+	end
+
+	updateMovementEvent.OnServerEvent:Connect(function(player: Player, payload: any)
+		if not isAuthorized(player) or typeof(payload) ~= "table" then
+			return
+		end
+
+		local state = states[player]
+		if not state then
+			state = {
+				speedEnabled = false,
+				speedValue = CONFIG.DefaultSpeed,
+				jumpEnabled = false,
+				jumpValue = CONFIG.DefaultJump,
+			}
+			states[player] = state
+		end
+
+		if typeof(payload.speedEnabled) == "boolean" then
+			state.speedEnabled = payload.speedEnabled
+		end
+		if typeof(payload.jumpEnabled) == "boolean" then
+			state.jumpEnabled = payload.jumpEnabled
+		end
+		if payload.speedValue ~= nil then
+			state.speedValue = sanitizeStat(payload.speedValue, state.speedValue)
+		end
+		if payload.jumpValue ~= nil then
+			state.jumpValue = sanitizeStat(payload.jumpValue, state.jumpValue)
+		end
+
+		if player.Character then
+			applyStats(player, player.Character)
+		end
+	end)
+
+	Players.PlayerAdded:Connect(function(player: Player)
+		states[player] = {
+			speedEnabled = false,
+			speedValue = CONFIG.DefaultSpeed,
+			jumpEnabled = false,
+			jumpValue = CONFIG.DefaultJump,
+		}
+
+		player.CharacterAdded:Connect(function(character: Model)
+			task.defer(function()
+				applyStats(player, character)
+			end)
+		end)
+	end)
+
+	Players.PlayerRemoving:Connect(function(player: Player)
+		states[player] = nil
+	end)
+end
+
+if RunService:IsClient() then
+	local localPlayer = Players.LocalPlayer
+	local camera = workspace.CurrentCamera
+
+	local runtime = {
+		isAuthorizedDev = false,
+		espEnabled = false,
+		aimEnabled = false,
+		speedEnabled = false,
+		jumpEnabled = false,
+		speedValue = CONFIG.DefaultSpeed,
+		jumpValue = CONFIG.DefaultJump,
+		minimized = false,
+	}
+
+	workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+		if workspace.CurrentCamera then
+			camera = workspace.CurrentCamera
+		end
+	end)
+
+	task.spawn(function()
+		local ok, allowed = pcall(function()
+			return checkAccessFunc:InvokeServer()
+		end)
+		if ok and typeof(allowed) == "boolean" then
+			runtime.isAuthorizedDev = allowed
+		end
+	end)
+
+	local function getRealPlayerRig(player: Player): (Model?, Humanoid?, BasePart?, BasePart?)
+		if player == localPlayer then
+			return nil, nil, nil, nil
+		end
+		if not Players:FindFirstChild(player.Name) then
+			return nil, nil, nil, nil
+		end
+
+		local char = player.Character
+		if not char or not char.Parent then
+			return nil, nil, nil, nil
+		end
+
+		local humanoid = char:FindFirstChildOfClass("Humanoid")
+		local head = char:FindFirstChild("Head") :: BasePart?
+		local root = char:FindFirstChild("HumanoidRootPart") :: BasePart?
+
+		if not humanoid or humanoid.Health <= 0 then
+			return nil, nil, nil, nil
+		end
+		if not head or not head:IsA("BasePart") or not root or not root:IsA("BasePart") then
+			return nil, nil, nil, nil
+		end
+
+		return char, humanoid, head, root
+	end
+
+	local function isVisible(part: BasePart, character: Model): boolean
+		local origin = camera.CFrame.Position
+		local delta = part.Position - origin
+		if delta.Magnitude <= 0.05 then
+			return true
+		end
+
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		local ignored: { Instance } = {}
+		if localPlayer.Character then
+			table.insert(ignored, localPlayer.Character)
+		end
+		params.FilterDescendantsInstances = ignored
+		params.IgnoreWater = true
+
+		local hit = workspace:Raycast(origin, delta, params)
+		if not hit then
+			return true
+		end
+		return hit.Instance:IsDescendantOf(character)
+	end
+
+	type BoxEdges = {
+		top: Frame,
+		bottom: Frame,
+		left: Frame,
+		right: Frame,
+	}
+
+	local playerGui = localPlayer:WaitForChild("PlayerGui")
+
+	local espGui = Instance.new("ScreenGui")
+	espGui.Name = "FreemiumV1_2_BoxEsp"
+	espGui.ResetOnSpawn = false
+	espGui.IgnoreGuiInset = true
+	espGui.DisplayOrder = 5
+	espGui.Parent = playerGui
+
+	local boxes: { [Player]: BoxEdges } = {}
+	local espConn: RBXScriptConnection? = nil
+
+	local function removeBox(player: Player)
+		local box = boxes[player]
+		if not box then
+			return
+		end
+		box.top:Destroy()
+		box.bottom:Destroy()
+		box.left:Destroy()
+		box.right:Destroy()
+		boxes[player] = nil
+	end
+
+	local function clearBoxes()
+		for player in pairs(boxes) do
+			removeBox(player)
+		end
+	end
+
+	local function getBox(player: Player): BoxEdges
+		local existing = boxes[player]
+		if existing then
+			return existing
+		end
+
+		local function makeEdge(name: string): Frame
+			local edge = Instance.new("Frame")
+			edge.Name = name
+			edge.BackgroundColor3 = CONFIG.EspColor
+			edge.BorderSizePixel = 0
+			edge.Visible = false
+			edge.ZIndex = 2
+			edge.Parent = espGui
+			return edge
+		end
+
+		local created: BoxEdges = {
+			top = makeEdge("Top"),
+			bottom = makeEdge("Bottom"),
+			left = makeEdge("Left"),
+			right = makeEdge("Right"),
+		}
+		boxes[player] = created
+		return created
+	end
+
+	local function setBoxVisible(box: BoxEdges, visible: boolean)
+		box.top.Visible = visible
+		box.bottom.Visible = visible
+		box.left.Visible = visible
+		box.right.Visible = visible
+	end
+
+	local function stepEsp()
+		if not runtime.espEnabled then
+			return
+		end
+
+		local active: { [Player]: boolean } = {}
+
+		for _, player in ipairs(Players:GetPlayers()) do
+			local char, _, head, root = getRealPlayerRig(player)
+			if not char or not head or not root then
+				removeBox(player)
+				continue
+			end
+
+			local canSee = isVisible(head, char) or isVisible(root, char)
+			if not canSee and not runtime.isAuthorizedDev then
+				local box = boxes[player]
+				if box then
+					setBoxVisible(box, false)
+				end
+				continue
+			end
+
+			active[player] = true
+			local box = getBox(player)
+
+			local cf, size = char:GetBoundingBox()
+			local hx, hy, hz = size.X * 0.5, size.Y * 0.5, size.Z * 0.5
+			local corners = {
+				cf * Vector3.new(-hx, hy, -hz),
+				cf * Vector3.new(hx, hy, -hz),
+				cf * Vector3.new(-hx, -hy, -hz),
+				cf * Vector3.new(hx, -hy, -hz),
+				cf * Vector3.new(-hx, hy, hz),
+				cf * Vector3.new(hx, hy, hz),
+				cf * Vector3.new(-hx, -hy, hz),
+				cf * Vector3.new(hx, -hy, hz),
+			}
+
+			local minX, minY = math.huge, math.huge
+			local maxX, maxY = -math.huge, -math.huge
+			local anyFront = false
+
+			for _, corner in ipairs(corners) do
+				local vp = camera:WorldToViewportPoint(corner)
+				if vp.Z > 0 then
+					anyFront = true
+					minX = math.min(minX, vp.X)
+					maxX = math.max(maxX, vp.X)
+					minY = math.min(minY, vp.Y)
+					maxY = math.max(maxY, vp.Y)
+				end
+			end
+
+			if not anyFront or maxX <= minX or maxY <= minY then
+				setBoxVisible(box, false)
+				continue
+			end
+
+			local x = math.floor(minX)
+			local y = math.floor(minY)
+			local w = math.clamp(maxX - minX, 6, 1280)
+			local h = math.clamp(maxY - minY, 10, 1440)
+			local t = CONFIG.EspThickness
+
+			box.top.Position = UDim2.fromOffset(x, y)
+			box.top.Size = UDim2.fromOffset(w, t)
+
+			box.bottom.Position = UDim2.fromOffset(x, y + h - t)
+			box.bottom.Size = UDim2.fromOffset(w, t)
+
+			box.left.Position = UDim2.fromOffset(x, y)
+			box.left.Size = UDim2.fromOffset(t, h)
+
+			box.right.Position = UDim2.fromOffset(x + w - t, y)
+			box.right.Size = UDim2.fromOffset(t, h)
+
+			setBoxVisible(box, true)
+		end
+
+		for player in pairs(boxes) do
+			if not active[player] then
+				removeBox(player)
+			end
+		end
+	end
+
+	local function setEspEnabled(enabled: boolean)
+		runtime.espEnabled = enabled
+		if enabled then
+			if not espConn then
+				espConn = RunService.RenderStepped:Connect(stepEsp)
+			end
+		else
+			if espConn then
+				espConn:Disconnect()
+				espConn = nil
+			end
+			clearBoxes()
+		end
+	end
+
+	local aimConn: RBXScriptConnection? = nil
+
+	local function findNearestRealPlayerHead(): (Player?, BasePart?, Model?)
+		local localRoot = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart") :: BasePart?
+		local origin = if localRoot then localRoot.Position else camera.CFrame.Position
+
+		local bestPlayer: Player? = nil
+		local bestHead: BasePart? = nil
+		local bestChar: Model? = nil
+		local bestDist = CONFIG.MaxLockDistance
+
+		for _, player in ipairs(Players:GetPlayers()) do
+			local char, _, head, root = getRealPlayerRig(player)
+			if not char or not head or not root then
+				continue
+			end
+
+			local dist = (root.Position - origin).Magnitude
+			if dist > bestDist then
+				continue
+			end
+
+			if not isVisible(head, char) then
+				continue
+			end
+
+			bestDist = dist
+			bestPlayer = player
+			bestHead = head
+			bestChar = char
+		end
+
+		return bestPlayer, bestHead, bestChar
+	end
+
+	local function stepAimLock()
+		if not runtime.aimEnabled then
+			return
+		end
+
+		local targetPlayer, targetHead, targetChar = findNearestRealPlayerHead()
+		if not targetPlayer or not targetHead or not targetChar then
+			return
+		end
+
+		if not isVisible(targetHead, targetChar) then
+			return
+		end
+
+		camera.CFrame = CFrame.lookAt(camera.CFrame.Position, targetHead.Position)
+	end
+
+	local function setAimEnabled(enabled: boolean)
+		runtime.aimEnabled = enabled
+		if enabled then
+			if not aimConn then
+				aimConn = RunService.RenderStepped:Connect(stepAimLock)
+			end
+		elseif aimConn then
+			aimConn:Disconnect()
+			aimConn = nil
+		end
+	end
+
+	local function syncMovement()
+		runtime.speedValue = math.clamp(runtime.speedValue, CONFIG.MinStat, CONFIG.MaxStat)
+		runtime.jumpValue = math.clamp(runtime.jumpValue, CONFIG.MinStat, CONFIG.MaxStat)
+
+		updateMovementEvent:FireServer({
+			speedEnabled = runtime.speedEnabled,
+			speedValue = runtime.speedValue,
+			jumpEnabled = runtime.jumpEnabled,
+			jumpValue = runtime.jumpValue,
+		})
+	end
+
+	movementAppliedEvent.OnClientEvent:Connect(function(payload: any)
+		if typeof(payload) == "table" then
+			if typeof(payload.speedValue) == "number" then
+				runtime.speedValue = math.clamp(payload.speedValue, CONFIG.MinStat, CONFIG.MaxStat)
+			end
+			if typeof(payload.jumpValue) == "number" then
+				runtime.jumpValue = math.clamp(payload.jumpValue, CONFIG.MinStat, CONFIG.MaxStat)
+			end
+		end
+	end)
+
+	Players.PlayerRemoving:Connect(function(player: Player)
+		removeBox(player)
+	end)
+
+	local oldPanel = playerGui:FindFirstChild("FreemiumV1_2Gui")
+	if oldPanel then
+		oldPanel:Destroy()
+	end
+
+	local panelGui = Instance.new("ScreenGui")
+	panelGui.Name = "FreemiumV1_2Gui"
+	panelGui.ResetOnSpawn = false
+	panelGui.IgnoreGuiInset = true
+	panelGui.DisplayOrder = 25
+	panelGui.Parent = playerGui
+
+	local panel = Instance.new("Frame")
+	panel.Name = "MainPanel"
+	panel.Size = UDim2.fromOffset(332, 420)
+	panel.Position = UDim2.new(0.5, -166, 0.5, -210)
+	panel.BackgroundColor3 = CONFIG.PanelBg
+	panel.BorderSizePixel = 0
+	panel.Active = true
+	panel.Parent = panelGui
+
+	local panelCorner = Instance.new("UICorner")
+	panelCorner.CornerRadius = UDim.new(0, 16)
+	panelCorner.Parent = panel
+
+	local panelStroke = Instance.new("UIStroke")
+	panelStroke.Color = CONFIG.BorderPurple
+	panelStroke.Thickness = 1.5
+	panelStroke.Parent = panel
+
+	local panelScale = Instance.new("UIScale")
+	panelScale.Parent = panel
+
+	local function fitViewport()
+		local vp = camera.ViewportSize
+		local shortest = math.min(vp.X, vp.Y)
+		if shortest < 430 then
+			panelScale.Scale = math.clamp((vp.X - 24) / 332, 0.72, 1)
+		else
+			panelScale.Scale = 1
+		end
+	end
+	fitViewport()
+	camera:GetPropertyChangedSignal("ViewportSize"):Connect(fitViewport)
+
+	local header = Instance.new("Frame")
+	header.Name = "Header"
+	header.Size = UDim2.new(1, 0, 0, 50)
+	header.BackgroundColor3 = CONFIG.HeaderBg
+	header.BorderSizePixel = 0
+	header.Active = true
+	header.Parent = panel
+
+	local headerCorner = Instance.new("UICorner")
+	headerCorner.CornerRadius = UDim.new(0, 16)
+	headerCorner.Parent = header
+
+	local title = Instance.new("TextLabel")
+	title.Name = "Title"
+	title.Size = UDim2.new(1, -64, 1, 0)
+	title.Position = UDim2.fromOffset(16, 0)
+	title.BackgroundTransparency = 1
+	title.Font = Enum.Font.GothamBold
+	title.Text = "FREEMIUM V1.2"
+	title.TextColor3 = CONFIG.TextLight
+	title.TextSize = 16
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.Parent = header
+
+	local closeBtn = Instance.new("TextButton")
+	closeBtn.Name = "CloseBtn"
+	closeBtn.Size = UDim2.fromOffset(38, 38)
+	closeBtn.Position = UDim2.new(1, -46, 0.5, -19)
+	closeBtn.BackgroundColor3 = CONFIG.AccentPurple
+	closeBtn.BorderSizePixel = 0
+	closeBtn.Font = Enum.Font.GothamBold
+	closeBtn.Text = "X"
+	closeBtn.TextColor3 = CONFIG.TextLight
+	closeBtn.TextSize = 15
+	closeBtn.Parent = header
+
+	local closeCorner = Instance.new("UICorner")
+	closeCorner.CornerRadius = UDim.new(0, 10)
+	closeCorner.Parent = closeBtn
+
+	local miniSquare = Instance.new("TextButton")
+	miniSquare.Name = "MiniSquare"
+	miniSquare.Size = UDim2.fromOffset(56, 56)
+	miniSquare.Position = UDim2.fromOffset(20, 110)
+	miniSquare.BackgroundColor3 = CONFIG.AccentPurple
+	miniSquare.BorderSizePixel = 0
+	miniSquare.Font = Enum.Font.GothamBold
+	miniSquare.Text = "F1.2"
+	miniSquare.TextColor3 = CONFIG.TextLight
+	miniSquare.TextSize = 13
+	miniSquare.Visible = false
+	miniSquare.Active = true
+	miniSquare.ZIndex = 35
+	miniSquare.Parent = panelGui
+
+	local miniCorner = Instance.new("UICorner")
+	miniCorner.CornerRadius = UDim.new(0, 12)
+	miniCorner.Parent = miniSquare
+
+	local miniStroke = Instance.new("UIStroke")
+	miniStroke.Color = CONFIG.TextSoft
+	miniStroke.Thickness = 1.5
+	miniStroke.Parent = miniSquare
+
+	type DragEntry = {
+		handle: GuiObject,
+		target: GuiObject,
+		onTap: (() -> Void)?,
+		active: boolean,
+		moved: boolean,
+		startInput: Vector2,
+		startPos: UDim2,
+	}
+
+	type SliderEntry = {
+		track: GuiObject,
+		active: boolean,
+		updateAtX: (number) -> (),
+	}
+
+	local dragEntries: { DragEntry } = {}
+	local sliderEntries: { SliderEntry } = {}
+
+	local function clampGuiPos(pos: UDim2, size: Vector2): UDim2
+		local vp = camera.ViewportSize
+		local maxX = math.max(0, vp.X - size.X)
+		local maxY = math.max(0, vp.Y - size.Y)
+		return UDim2.fromOffset(
+			math.clamp(pos.X.Offset, 0, maxX),
+			math.clamp(pos.Y.Offset, 0, maxY)
+		)
+	end
+
+	local function registerDrag(handle: GuiObject, target: GuiObject, onTap: (() -> Void)?)
+		local entry: DragEntry = {
+			handle = handle,
+			target = target,
+			onTap = onTap,
+			active = false,
+			moved = false,
+			startInput = Vector2.zero,
+			startPos = UDim2.new(),
+		}
+		table.insert(dragEntries, entry)
+
+		handle.InputBegan:Connect(function(input: InputObject)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				entry.active = true
+				entry.moved = false
+				entry.startInput = Vector2.new(input.Position.X, input.Position.Y)
+				local abs = target.AbsolutePosition
+				entry.startPos = UDim2.fromOffset(abs.X, abs.Y)
+			end
+		end)
+	end
+
+	UserInputService.InputChanged:Connect(function(input: InputObject)
+		if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then
+			return
+		end
+
+		local pos = Vector2.new(input.Position.X, input.Position.Y)
+		for _, entry in ipairs(dragEntries) do
+			if entry.active then
+				local delta = pos - entry.startInput
+				if delta.Magnitude > 6 then
+					entry.moved = true
+				end
+				local nextPos = UDim2.fromOffset(entry.startPos.X.Offset + delta.X, entry.startPos.Y.Offset + delta.Y)
+				entry.target.Position = clampGuiPos(nextPos, entry.target.AbsoluteSize)
+			end
+		end
+
+		for _, slider in ipairs(sliderEntries) do
+			if slider.active then
+				slider.updateAtX(pos.X)
+			end
+		end
+	end)
+
+	UserInputService.InputEnded:Connect(function(input: InputObject)
+		if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then
+			return
+		end
+
+		for _, entry in ipairs(dragEntries) do
+			if entry.active and not entry.moved and entry.onTap then
+				entry.onTap()
+			end
+			entry.active = false
+		end
+
+		for _, slider in ipairs(sliderEntries) do
+			slider.active = false
+		end
+	end)
+
+	local function setMinimized(minimized: boolean)
+		runtime.minimized = minimized
+		panel.Visible = not minimized
+		miniSquare.Visible = minimized
+	end
+
+	closeBtn.Activated:Connect(function()
+		setMinimized(true)
+	end)
+
+	registerDrag(header, panel, nil)
+	registerDrag(miniSquare, miniSquare, function()
+		setMinimized(false)
+	end)
+
+	local scroll = Instance.new("ScrollingFrame")
+	scroll.Name = "Controls"
+	scroll.Size = UDim2.new(1, -24, 1, -62)
+	scroll.Position = UDim2.fromOffset(12, 56)
+	scroll.BackgroundTransparency = 1
+	scroll.BorderSizePixel = 0
+	scroll.ScrollBarThickness = 4
+	scroll.CanvasSize = UDim2.fromOffset(0, 350)
+	scroll.Parent = panel
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 10)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = scroll
+
+	local function makeToggle(titleText: string, order: number, callback: (boolean) -> Void)
+		local row = Instance.new("Frame")
+		row.Name = titleText .. "Row"
+		row.LayoutOrder = order
+		row.Size = UDim2.new(1, 0, 0, 48)
+		row.BackgroundColor3 = CONFIG.CardBg
+		row.BorderSizePixel = 0
+		row.Parent = scroll
+
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 12)
+		corner.Parent = row
+
+		local label = Instance.new("TextLabel")
+		label.Size = UDim2.new(1, -108, 1, 0)
+		label.Position = UDim2.fromOffset(14, 0)
+		label.BackgroundTransparency = 1
+		label.Font = Enum.Font.GothamBold
+		label.Text = titleText
+		label.TextColor3 = CONFIG.TextLight
+		label.TextSize = 13
+		label.TextXAlignment = Enum.TextXAlignment.Left
+		label.Parent = row
+
+		local button = Instance.new("TextButton")
+		button.Size = UDim2.fromOffset(86, 34)
+		button.Position = UDim2.new(1, -96, 0.5, -17)
+		button.BackgroundColor3 = CONFIG.OffRed
+		button.BorderSizePixel = 0
+		button.Font = Enum.Font.GothamBold
+		button.Text = "OFF"
+		button.TextColor3 = CONFIG.TextLight
+		button.TextSize = 12
+		button.Parent = row
+
+		local btnCorner = Instance.new("UICorner")
+		btnCorner.CornerRadius = UDim.new(0, 8)
+		btnCorner.Parent = button
+
+		local active = false
+		button.Activated:Connect(function()
+			active = not active
+			button.Text = if active then "ON" else "OFF"
+			button.BackgroundColor3 = if active then CONFIG.OnGreen else CONFIG.OffRed
+			callback(active)
+		end)
+	end
+
+	local function makeSlider(titleText: string, startValue: number, order: number, callback: (number) -> Void)
+		local row = Instance.new("Frame")
+		row.Name = titleText .. "Row"
+		row.LayoutOrder = order
+		row.Size = UDim2.new(1, 0, 0, 68)
+		row.BackgroundColor3 = CONFIG.CardBg
+		row.BorderSizePixel = 0
+		row.Parent = scroll
+
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 12)
+		corner.Parent = row
+
+		local top = Instance.new("Frame")
+		top.Size = UDim2.new(1, -28, 0, 22)
+		top.Position = UDim2.fromOffset(14, 8)
+		top.BackgroundTransparency = 1
+		top.Parent = row
+
+		local nameLbl = Instance.new("TextLabel")
+		nameLbl.Size = UDim2.new(0.65, 0, 1, 0)
+		nameLbl.BackgroundTransparency = 1
+		nameLbl.Font = Enum.Font.GothamSemibold
+		nameLbl.Text = titleText
+		nameLbl.TextColor3 = CONFIG.TextSoft
+		nameLbl.TextSize = 12
+		nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+		nameLbl.Parent = top
+
+		local valLbl = Instance.new("TextLabel")
+		valLbl.Size = UDim2.new(0.35, 0, 1, 0)
+		valLbl.Position = UDim2.fromScale(0.65, 0)
+		valLbl.BackgroundTransparency = 1
+		valLbl.Font = Enum.Font.GothamBold
+		valLbl.Text = tostring(startValue)
+		valLbl.TextColor3 = CONFIG.TextLight
+		valLbl.TextSize = 13
+		valLbl.TextXAlignment = Enum.TextXAlignment.Right
+		valLbl.Parent = top
+
+		local track = Instance.new("TextButton")
+		track.Name = "SliderTrack"
+		track.Size = UDim2.new(1, -28, 0, 18)
+		track.Position = UDim2.fromOffset(14, 38)
+		track.BackgroundColor3 = CONFIG.TrackBg
+		track.BorderSizePixel = 0
+		track.Text = ""
+		track.AutoButtonColor = false
+		track.Parent = row
+
+		local trackCorner = Instance.new("UICorner")
+		trackCorner.CornerRadius = UDim.new(1, 0)
+		trackCorner.Parent = track
+
+		local fill = Instance.new("Frame")
+		fill.Name = "Fill"
+		fill.Size = UDim2.fromScale(math.clamp(startValue / CONFIG.MaxStat, 0, 1), 1)
+		fill.BackgroundColor3 = CONFIG.AccentPurple
+		fill.BorderSizePixel = 0
+		fill.Parent = track
+
+		local fillCorner = Instance.new("UICorner")
+		fillCorner.CornerRadius = UDim.new(1, 0)
+		fillCorner.Parent = fill
+
+		local currentVal = math.clamp(startValue, CONFIG.MinStat, CONFIG.MaxStat)
+
+		local function setVal(v: number)
+			currentVal = math.clamp(math.floor(v + 0.5), CONFIG.MinStat, CONFIG.MaxStat)
+			fill.Size = UDim2.fromScale(currentVal / CONFIG.MaxStat, 1)
+			valLbl.Text = tostring(currentVal)
+			callback(currentVal)
+		end
+
+		local function updateAtX(screenX: number)
+			local leftEdge = track.AbsolutePosition.X
+			local width = math.max(track.AbsoluteSize.X, 1)
+			local ratio = math.clamp((screenX - leftEdge) / width, 0, 1)
+			setVal(CONFIG.MinStat + ratio * (CONFIG.MaxStat - CONFIG.MinStat))
+		end
+
+		local entry: SliderEntry = {
+			track = track,
+			active = false,
+			updateAtX = updateAtX,
+		}
+		table.insert(sliderEntries, entry)
+
+		track.InputBegan:Connect(function(input: InputObject)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				entry.active = true
+				updateAtX(input.Position.X)
+			end
+		end)
+	end
+
+	makeToggle("BOX ESP", 1, function(enabled: boolean)
+		setEspEnabled(enabled)
+	end)
+
+	makeToggle("AIM", 2, function(enabled: boolean)
+		setAimEnabled(enabled)
+	end)
+
+	makeToggle("SPEED", 3, function(enabled: boolean)
+		runtime.speedEnabled = enabled
+		syncMovement()
+	end)
+
+	makeSlider("SPEED (0 - 100)", runtime.speedValue, 4, function(val: number)
+		runtime.speedValue = val
+		if runtime.speedEnabled then
+			syncMovement()
+		end
+	end)
+
+	makeToggle("JUMP", 5, function(enabled: boolean)
+		runtime.jumpEnabled = enabled
+		syncMovement()
+	end)
+
+	makeSlider("JUMP (0 - 100)", runtime.jumpValue, 6, function(val: number)
+		runtime.jumpValue = val
+		if runtime.jumpEnabled then
+			syncMovement()
+		end
+	end)
+end
